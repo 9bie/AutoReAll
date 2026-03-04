@@ -71,8 +71,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit upload size to 500MB
-	r.ParseMultipartForm(500 << 20)
+	// Limit upload size to 2GB
+	r.ParseMultipartForm(2 << 30)
 
 	file, header, err := r.FormFile("jarfile")
 	if err != nil {
@@ -234,19 +234,40 @@ func postProcessWAR(originalJarPath, taskOutputDir, taskUploadDir string) string
 	}
 
 	// ── Guess package name ──
-	// Try WEB-INF/classes first, fall back to the decompiled root
-	classesDir := filepath.Join(extractDir, "WEB-INF", "classes")
-	mergeTargetDir := classesDir // where to merge decompiled lib results
+	// Recursively find all directories named 'classes' in the extracted output
+	var classesDirs []string
+	filepath.Walk(extractDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() && info.Name() == "classes" {
+			classesDirs = append(classesDirs, path)
+		}
+		return nil
+	})
 
-	if _, err := os.Stat(classesDir); os.IsNotExist(err) {
-		logBuf.WriteString("ℹ 未找到 WEB-INF/classes，将从反编译根目录分析包名\n")
-		classesDir = extractDir // use the root for package detection
-		mergeTargetDir = extractDir
+	// Determine the package analysis source and merge target
+	var analysisDir string
+	var mergeTargetDir string
+
+	if len(classesDirs) > 0 {
+		analysisDir = classesDirs[0]
+		mergeTargetDir = classesDirs[0]
+		relClassesPath, _ := filepath.Rel(extractDir, classesDirs[0])
+		logBuf.WriteString(fmt.Sprintf("ℹ 发现 classes 目录: %s\n", relClassesPath))
+		if len(classesDirs) > 1 {
+			for _, d := range classesDirs[1:] {
+				rel, _ := filepath.Rel(extractDir, d)
+				logBuf.WriteString(fmt.Sprintf("  （另有 classes 目录: %s）\n", rel))
+			}
+		}
 	} else {
-		logBuf.WriteString("ℹ 发现 WEB-INF/classes 目录\n")
+		logBuf.WriteString("ℹ 未找到 classes 目录，将从反编译根目录分析包名\n")
+		analysisDir = extractDir
+		mergeTargetDir = extractDir
 	}
 
-	analysis := guessPackageFromClasses(classesDir)
+	analysis := guessPackageFromClasses(analysisDir)
 	logBuf.WriteString(analysis.debugLog)
 
 	if len(analysis.packages) == 0 {
@@ -408,14 +429,77 @@ type packageAnalysis struct {
 	debugLog string   // detailed debug info
 }
 
-// guessPackageFromClasses scans WEB-INF/classes to detect the root package name(s)
-// It looks for the most common top-level package dirs that contain .class or .java files
+// Spring Boot / common framework packages to ignore during matching
+var ignoredPackages = map[string]bool{
+	"org/springframework": true,
+	"org/apache":          true,
+	"org/hibernate":       true,
+	"org/mybatis":         true,
+	"org/thymeleaf":       true,
+	"org/slf4j":           true,
+	"org/aspectj":         true,
+	"org/jboss":           true,
+	"org/eclipse":         true,
+	"org/yaml":            true,
+	"org/json":            true,
+	"org/xml":             true,
+	"org/w3c":             true,
+	"org/ietf":            true,
+	"org/objectweb":       true,
+	"org/aopalliance":     true,
+	"org/attoparser":      true,
+	"org/unbescape":       true,
+	"org/reactivestreams": true,
+	"com/google":          true,
+	"com/fasterxml":       true,
+	"com/zaxxer":          true,
+	"com/sun":             true,
+	"com/mysql":           true,
+	"com/microsoft":       true,
+	"com/alibaba":         true,
+	"com/baomidou":        true,
+	"com/github":          true,
+	"jakarta/servlet":     true,
+	"jakarta/annotation":  true,
+	"javax/servlet":       true,
+	"javax/annotation":    true,
+	"javax/persistence":   true,
+	"javax/validation":    true,
+	"io/netty":            true,
+	"io/micrometer":       true,
+	"io/swagger":          true,
+	"net/bytebuddy":       true,
+	"net/minidev":         true,
+	"ch/qos":              true,
+	"redis/clients":       true,
+	"javassist":           true,
+	"META-INF":            true,
+}
+
+// isIgnoredPackage checks if a package path starts with any ignored prefix
+func isIgnoredPackage(pkgPath string) bool {
+	parts := strings.Split(pkgPath, "/")
+	if len(parts) >= 1 {
+		if ignoredPackages[parts[0]] {
+			return true
+		}
+	}
+	if len(parts) >= 2 {
+		if ignoredPackages[strings.Join(parts[:2], "/")] {
+			return true
+		}
+	}
+	return false
+}
+
+// guessPackageFromClasses scans a classes directory to detect the root package name(s)
+// Spring Boot and common framework packages are automatically ignored
 func guessPackageFromClasses(classesDir string) packageAnalysis {
 	var dbg strings.Builder
 
-	// Collect all package paths that contain actual files
-	packageCount := make(map[string]int)  // 2-level counts
-	packageCount3 := make(map[string]int) // 3-level counts
+	packageCount := make(map[string]int)
+	packageCount3 := make(map[string]int)
+	ignoredCount := make(map[string]int)
 	totalFiles := 0
 
 	filepath.Walk(classesDir, func(path string, info os.FileInfo, err error) error {
@@ -423,7 +507,6 @@ func guessPackageFromClasses(classesDir string) packageAnalysis {
 			return nil
 		}
 
-		// Only consider .java and .class files
 		ext := strings.ToLower(filepath.Ext(path))
 		if ext != ".java" && ext != ".class" {
 			return nil
@@ -439,6 +522,12 @@ func guessPackageFromClasses(classesDir string) packageAnalysis {
 		parts := strings.Split(filepath.ToSlash(dir), "/")
 		if len(parts) >= 2 {
 			base := strings.Join(parts[:2], "/")
+
+			if isIgnoredPackage(base) {
+				ignoredCount[base]++
+				return nil
+			}
+
 			packageCount[base]++
 
 			if len(parts) >= 3 {
@@ -449,7 +538,15 @@ func guessPackageFromClasses(classesDir string) packageAnalysis {
 		return nil
 	})
 
-	dbg.WriteString(fmt.Sprintf("\n  📊 WEB-INF/classes 分析结果 (共 %d 个源文件):\n", totalFiles))
+	dbg.WriteString(fmt.Sprintf("\n  📊 classes 目录分析结果 (共 %d 个源文件):\n", totalFiles))
+
+	if len(ignoredCount) > 0 {
+		dbg.WriteString("  ┌─ 已忽略的框架包名:\n")
+		for pkg, cnt := range ignoredCount {
+			dotPkg := strings.ReplaceAll(pkg, "/", ".")
+			dbg.WriteString(fmt.Sprintf("  │  %-40s  %d 个文件 (忽略)\n", dotPkg, cnt))
+		}
+	}
 
 	if len(packageCount) == 0 {
 		dbg.WriteString("  ⚠ 未找到任何包结构\n")
