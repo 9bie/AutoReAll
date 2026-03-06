@@ -602,10 +602,10 @@
         <!-- Header -->
         <div class="header">
             <div class="logo">
-                <div class="logo-icon">☕</div>
-                <span class="logo-text">ReJava Web</span>
+                <div class="logo-icon">⚙️</div>
+                <span class="logo-text">AutoReAll</span>
             </div>
-            <p class="subtitle">上传 JAR 文件，一键反编译为 Java 源代码</p>
+            <p class="subtitle">上传 JAR/WAR/EXE/DLL 文件，一键反编译为源代码</p>
         </div>
 
         <!-- Upload Card -->
@@ -617,8 +617,8 @@
             <div class="dropzone" id="dropzone">
                 <span class="dropzone-icon">📦</span>
                 <p class="dropzone-text">拖拽文件到此处，或 <strong>点击选择</strong></p>
-                <p class="dropzone-hint">支持 .jar / .war 文件，最大 2GB</p>
-                <input type="file" class="file-input" id="fileInput" accept=".jar,.war">
+                <p class="dropzone-hint">支持 .jar / .war / .exe / .dll 文件，最大 2GB</p>
+                <input type="file" class="file-input" id="fileInput" accept=".jar,.war,.exe,.dll">
             </div>
 
             <div class="file-info" id="fileInfo">
@@ -722,8 +722,8 @@
 
         function handleFile(file) {
             const name = file.name.toLowerCase();
-            if (!name.endsWith('.jar') && !name.endsWith('.war')) {
-                alert('请选择 .jar 或 .war 文件');
+            if (!name.endsWith('.jar') && !name.endsWith('.war') && !name.endsWith('.exe') && !name.endsWith('.dll')) {
+                alert('请选择 .jar / .war / .exe / .dll 文件');
                 return;
             }
             selectedFile = file;

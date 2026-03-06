@@ -18,6 +18,7 @@ import (
 
 var (
 	decompilerJar string
+	ilspyCmd      string
 	outputDir     string
 	uploadDir     string
 	port          string
@@ -25,13 +26,14 @@ var (
 
 func main() {
 	flag.StringVar(&decompilerJar, "decompiler", "", "Path to java-decompiler.jar (IntelliJ ConsoleDecompiler)")
+	flag.StringVar(&ilspyCmd, "ilspy", "ilspycmd", "Path to ilspycmd (ILSpy command-line decompiler)")
 	flag.StringVar(&outputDir, "output", "./output", "Directory for decompiled output")
-	flag.StringVar(&uploadDir, "upload", "./uploads", "Directory for uploaded JAR files")
+	flag.StringVar(&uploadDir, "upload", "./uploads", "Directory for uploaded files")
 	flag.StringVar(&port, "port", "8080", "HTTP server listen port")
 	flag.Parse()
 
 	if decompilerJar == "" {
-		log.Fatal("ERROR: -decompiler flag is required. Provide the path to java-decompiler.jar")
+		log.Println("⚠ -decompiler 未设置，JAR/WAR 反编译功能不可用")
 	}
 
 	// Ensure directories exist
@@ -43,10 +45,11 @@ func main() {
 	http.HandleFunc("/download/", handleDownload)
 
 	addr := ":" + port
-	log.Printf("🚀 ReJava Web server starting on http://localhost%s", addr)
-	log.Printf("   Decompiler JAR: %s", decompilerJar)
-	log.Printf("   Output Dir:     %s", outputDir)
-	log.Printf("   Upload Dir:     %s", uploadDir)
+	log.Printf("🚀 AutoReAll server starting on http://localhost%s", addr)
+	log.Printf("   Java Decompiler: %s", decompilerJar)
+	log.Printf("   ILSpy Command:   %s", ilspyCmd)
+	log.Printf("   Output Dir:      %s", outputDir)
+	log.Printf("   Upload Dir:      %s", uploadDir)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
@@ -64,7 +67,19 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	tmpl.Execute(w, nil)
 }
 
-// handleUpload receives JAR/WAR file, runs decompiler, returns result
+// getFileType returns the type of file: "java", "dotnet", or ""
+func getFileType(filename string) string {
+	lower := strings.ToLower(filename)
+	if strings.HasSuffix(lower, ".jar") || strings.HasSuffix(lower, ".war") {
+		return "java"
+	}
+	if strings.HasSuffix(lower, ".exe") || strings.HasSuffix(lower, ".dll") {
+		return "dotnet"
+	}
+	return ""
+}
+
+// handleUpload receives file, detects type, runs appropriate decompiler
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -85,11 +100,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	// Validate file extension
-	lowerName := strings.ToLower(header.Filename)
-	if !strings.HasSuffix(lowerName, ".jar") && !strings.HasSuffix(lowerName, ".war") {
+	fileType := getFileType(header.Filename)
+	if fileType == "" {
 		sendJSON(w, http.StatusBadRequest, map[string]interface{}{
 			"success": false,
-			"error":   "Only .jar / .war files are accepted",
+			"error":   "仅支持 .jar / .war / .exe / .dll 文件",
 		})
 		return
 	}
@@ -102,8 +117,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(taskOutputDir, 0755)
 
 	// Save uploaded file
-	jarPath := filepath.Join(taskUploadDir, header.Filename)
-	dst, err := os.Create(jarPath)
+	savePath := filepath.Join(taskUploadDir, header.Filename)
+	dst, err := os.Create(savePath)
 	if err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"success": false,
@@ -114,14 +129,36 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	io.Copy(dst, file)
 	dst.Close()
 
-	log.Printf("📦 Received: %s (%d bytes), Task ID: %s", header.Filename, header.Size, taskID)
+	filePath := filepath.Join(taskUploadDir, header.Filename)
+	log.Printf("📦 Received: %s (%d bytes), Type: %s, Task ID: %s", header.Filename, header.Size, fileType, taskID)
 
-	// ══════════════════════════════════════════════════════════
-	// Step 1: Decompile the uploaded JAR/WAR
-	// ══════════════════════════════════════════════════════════
 	var allLog strings.Builder
 
-	allLog.WriteString("═══ Step 1: Decompiling uploaded file ═══\n")
+	// ══════════════════════════════════════════════════════════
+	// Dispatch by file type
+	// ══════════════════════════════════════════════════════════
+	switch fileType {
+	case "java":
+		handleJavaDecompile(w, &allLog, filePath, taskOutputDir, taskUploadDir, taskID)
+		return
+	case "dotnet":
+		handleDotNetDecompile(w, &allLog, filePath, taskOutputDir, taskUploadDir, taskID)
+		return
+	}
+}
+
+// handleJavaDecompile handles JAR/WAR decompilation
+func handleJavaDecompile(w http.ResponseWriter, allLog *strings.Builder, jarPath, taskOutputDir, taskUploadDir, taskID string) {
+	if decompilerJar == "" {
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"success": false,
+			"error":   "Java 反编译器未配置，请使用 -decompiler 参数指定 java-decompiler.jar 路径",
+			"taskId":  taskID,
+		})
+		return
+	}
+
+	allLog.WriteString("═══ Step 1: 反编译 JAR/WAR 文件 ═══\n")
 	cmd := exec.Command("java", "-cp", decompilerJar,
 		"org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler",
 		"-dgs=true", jarPath, taskOutputDir)
@@ -133,7 +170,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("❌ Decompile failed for task %s: %v", taskID, err)
 		sendJSON(w, http.StatusOK, map[string]interface{}{
 			"success": false,
-			"error":   "Decompile failed: " + err.Error(),
+			"error":   "反编译失败: " + err.Error(),
 			"log":     allLog.String(),
 			"taskId":  taskID,
 		})
@@ -142,24 +179,68 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("✅ Step 1 decompile success for task %s", taskID)
 
-	// ══════════════════════════════════════════════════════════
-	// Step 2: Extract decompiled output and process WEB-INF/lib
-	// ══════════════════════════════════════════════════════════
-	allLog.WriteString("\n═══ Step 2: Post-processing WEB-INF/lib ═══\n")
+	allLog.WriteString("\n═══ Step 2: 后处理 - 扫描内嵌 JAR ═══\n")
 	postLog := postProcessWAR(jarPath, taskOutputDir, taskUploadDir)
 	allLog.WriteString(postLog)
 
 	log.Printf("✅ All steps complete for task %s", taskID)
 
+	finalizeTask(w, allLog, taskOutputDir, taskUploadDir, taskID)
+}
+
+// handleDotNetDecompile handles .exe/.dll decompilation using ILSpy
+func handleDotNetDecompile(w http.ResponseWriter, allLog *strings.Builder, exePath, taskOutputDir, taskUploadDir, taskID string) {
+	allLog.WriteString("═══ Step 1: 使用 ILSpy 反编译 .NET 程序 ═══\n")
+	allLog.WriteString(fmt.Sprintf("📄 输入文件: %s\n", filepath.Base(exePath)))
+	allLog.WriteString(fmt.Sprintf("🔧 ILSpy 命令: %s\n", ilspyCmd))
+
+	// ilspycmd -p -o <outputDir> <input.exe>
+	// -p : generate project files (.csproj)
+	// -o : output directory
+	cmd := exec.Command(ilspyCmd, "-p", "-o", taskOutputDir, exePath)
+
+	output, err := cmd.CombinedOutput()
+	allLog.Write(output)
+
+	if err != nil {
+		log.Printf("❌ ILSpy decompile failed for task %s: %v", taskID, err)
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"success": false,
+			"error":   "ILSpy 反编译失败: " + err.Error(),
+			"log":     allLog.String(),
+			"taskId":  taskID,
+		})
+		return
+	}
+
+	log.Printf("✅ ILSpy decompile success for task %s", taskID)
+	allLog.WriteString("\n✅ .NET 反编译完成\n")
+
+	// Check if there are other DLLs in the same upload dir to also decompile
+	// (user might have uploaded a single EXE, but we can note the result)
+	fileCount := 0
+	filepath.Walk(taskOutputDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	allLog.WriteString(fmt.Sprintf("📊 反编译产出 %d 个文件\n", fileCount))
+
+	finalizeTask(w, allLog, taskOutputDir, taskUploadDir, taskID)
+}
+
+// finalizeTask packages output as ZIP, cleans up cache, and sends response
+func finalizeTask(w http.ResponseWriter, allLog *strings.Builder, taskOutputDir, taskUploadDir, taskID string) {
 	// Create final zip of output
-	allLog.WriteString("\n═══ Step 3: Packaging results ═══\n")
+	allLog.WriteString("\n═══ Packaging results ═══\n")
 	zipPath := filepath.Join(outputDir, taskID+".zip")
 	if err := createZip(taskOutputDir, zipPath); err != nil {
 		sendJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"log":     allLog.String(),
 			"taskId":  taskID,
-			"error":   "Decompile succeeded but failed to create zip: " + err.Error(),
+			"error":   "反编译成功但打包失败: " + err.Error(),
 		})
 		return
 	}
@@ -170,19 +251,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		allLog.WriteString(fmt.Sprintf("📦 ZIP 已创建: %.2f MB\n", sizeMB))
 	}
 
-	// ══════════════════════════════════════════════════════════
-	// Step 4: Cleanup — remove decompile cache directories
-	// ══════════════════════════════════════════════════════════
-	allLog.WriteString("\n═══ Step 4: Cleaning up cache ═══\n")
+	// Cleanup cache directories
+	allLog.WriteString("\n═══ Cleaning up cache ═══\n")
 
-	// Remove the task output directory (extracted files, no longer needed after zip)
 	if err := os.RemoveAll(taskOutputDir); err != nil {
 		allLog.WriteString(fmt.Sprintf("⚠ 清理输出目录失败: %v\n", err))
 	} else {
 		allLog.WriteString(fmt.Sprintf("🗑 已删除输出缓存: %s\n", taskOutputDir))
 	}
 
-	// Remove the upload directory (uploaded file + temp extracts)
 	if err := os.RemoveAll(taskUploadDir); err != nil {
 		allLog.WriteString(fmt.Sprintf("⚠ 清理上传目录失败: %v\n", err))
 	} else {
